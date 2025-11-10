@@ -1,0 +1,17 @@
+astra_db:
+  collection_name: ecommercedata_clean
+
+
+embedding_model:
+  provider: "openai"
+  model_name: "text-embedding-3-small"
+
+retriever:
+  top_k: 4
+
+llm:
+  openai:
+    provider: "openai"
+    model_name: "gpt-4o"
+    temperature: 0.2
+    max_output_tokens: 2048
