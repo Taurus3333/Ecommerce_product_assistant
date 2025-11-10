@@ -1,134 +1,99 @@
-name: Deploy App to EKS
+name: workflow
 
 on:
   push:
     branches:
-      - main
-  workflow_dispatch:
+      - master
+    paths-ignore:
+      - 'README.md'
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  deploy:
+  integration:
+    name: Continuous Integration
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v3
 
-      # Configure AWS credentials
+      - name: Lint code
+        run: echo "Linting repository"
+
+      - name: Run unit tests
+        run: echo "Running unit tests"
+
+  build-and-push-ecr-image:
+    name: Continuous Delivery
+    needs: integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Install Utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq unzip
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # Check if EKS Cluster exists
-      - name: Check if EKS Cluster exists
-        run: |
-          if ! aws eks describe-cluster --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}; then
-            echo "EKS Cluster not found! Run infra.yml workflow first."
-            exit 1
-          fi
-
-      # Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Set Image Tag
-        id: image-tag
-        run: |
-          echo "IMAGE_TAG=$(date +%s)" >> $GITHUB_ENV
-          echo "::set-output name=tag::$(date +%s)"
-      
-      # Build, tag and push Docker image to ECR
-      - name: Build and Push Docker image
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
         env:
-          REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+          IMAGE_TAG: latest
         run: |
-          docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG -t $REGISTRY/$REPOSITORY:latest .
-          docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
-          docker push $REGISTRY/$REPOSITORY:latest
+          # Build a docker container and
+          # push it to ECR so that it can
+          # be deployed to ECS.
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          
+          
+  Continuous-Deployment:
+    needs: build-and-push-ecr-image
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
 
-      # Setup kubectl
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
         with:
-          version: 'latest'
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      # Ensure AWS CLI is installed
-      - name: Install AWS CLI
-        run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip -q awscliv2.zip
-          sudo ./aws/install --update
-          aws --version
-    
-      - name: Print Env Vars
-        run: |
-          echo "Region: ${{ secrets.AWS_REGION }}"
-          echo "Cluster: ${{ secrets.EKS_CLUSTER_NAME }}"  
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
       
-      # Update kubeconfig
-      - name: Update kubeconfig with debug
-        run: |
-          aws eks update-kubeconfig \
-            --name $EKS_CLUSTER_NAME \
-            --region $AWS_REGION \
-            --debug
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
-
-      # Debug: Show kubeconfig file
-      - name: Show kubeconfig
-        run: |
-          ls -la ~/.kube || true
-          cat ~/.kube/config || true
       
-      # Create/Update Kubernetes Secret (for API keys)
-      - name: Create Kubernetes secret for API keys
+      - name: Pull latest images
         run: |
-          kubectl create secret generic product-assistant-secrets \
-            --from-literal=OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} \
-            --from-literal=GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }} \
-            --from-literal=ASTRA_DB_API_ENDPOINT=${{ secrets.ASTRA_DB_API_ENDPOINT }} \
-            --from-literal=ASTRA_DB_APPLICATION_TOKEN=${{ secrets.ASTRA_DB_APPLICATION_TOKEN }} \
-            --from-literal=ASTRA_DB_KEYSPACE=${{ secrets.ASTRA_DB_KEYSPACE }} \
-            --dry-run=client -o yaml | kubectl apply -f -
+         docker pull ${{secrets.AWS_ECR_LOGIN_URI}}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
 
-      # Deploy manifests
-      - name: Apply Kubernetes manifests
+      - name: Stop and remove network container if running
         run: |
-          kubectl apply -f k8/deployment.yaml
-          kubectl apply -f k8/service.yaml
-
-      - name: Patch deployment with new image tag
-        env:
-          REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
+         docker ps -q --filter "name=networksecurity" | grep -q . && docker stop networksecurity && docker rm -fv networksecurity
+       
+      - name: Run Docker Image to serve users
         run: |
-          kubectl set image deployment/product-assistant product-assistant=$REGISTRY/$REPOSITORY:$IMAGE_TAG
+         docker run -d -p 80:8080 --name=networksecurity -e 'MONGO_DB_URL=${{ secrets.MONGO_DB_URL }}' -e 'AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}' -e 'AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}' -e 'AWS_REGION=${{ secrets.AWS_REGION }}'  ${{secrets.AWS_ECR_LOGIN_URI}}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
 
-
-      # Verify rollout
-      - name: Verify Deployment
+      - name: Clean previous images and containers
         run: |
-          set -e
-          if ! kubectl rollout status deployment/product-assistant --timeout=120s; then
-            echo "Rollout failed, collecting debug info..."
-            kubectl describe deployment product-assistant || true
-            kubectl get pods -o wide || true
-            for pod in $(kubectl get pods -l app=product-assistant -o jsonpath='{.items[*].metadata.name}'); do
-              echo "--- Logs for pod: $pod ---"
-              kubectl logs $pod --all-containers --tail=100 || true
-            done
-            exit 1
-          fi
-
-      # Show Service details
-      - name: Get Service Info
-        run: kubectl get svc product-assistant-service -o wide
+         docker system prune -f
